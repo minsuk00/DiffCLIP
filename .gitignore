@@ -1,0 +1,4 @@
+*.pyc
+ΩTODO.ipynb
+lightning_logs
+*.pt
