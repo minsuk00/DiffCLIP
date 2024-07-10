@@ -1,5 +1,5 @@
 *.pyc
 *NOTE.md
 *TEST.ipynb
-# *.pt
+*.pt
 imagenet_indices.pth
