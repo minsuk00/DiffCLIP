@@ -1,4 +1,5 @@
 *.pyc
-ΩTODO.ipynb
-lightning_logs
-*.pt
+*NOTE.md
+*TEST.ipynb
+# *.pt
+imagenet_indices.pth

@@ -61,11 +61,8 @@ def collect_features(model, loader, device):
         eta_seconds = (total_len - (cnt + 1)) * avg_time_per_batch
         print(
             f"collect done: {cnt+1} / {total_len}, eta: {timedelta(seconds=eta_seconds)}, time_passed: {timedelta(seconds=(time.time()-start_time))}",
-            # end="\r",
+            end="\r",
         )
-
-        if cnt >= 0:
-            break
 
     X = torch.cat(X).detach().numpy()
     Y = torch.cat(Y).detach().numpy()
@@ -75,10 +72,20 @@ def collect_features(model, loader, device):
 
 
 class CLIPVisionLinEval(L.LightningModule):
-    def __init__(self, ckpt):
+    def __init__(self, ckpt=None):
         super().__init__()
+        self.model = CLIPVisionModel.from_pretrained("/scratch/choi/model/CLIP-ViT-H-14-laion2B-s32B-b79K")
+        # load finetuned clip model
+        if ckpt:
+            checkpoint = torch.load(ckpt, map_location="cpu")
+            clipmodel_keys = {
+                k.replace("clip_model.", ""): v
+                for k, v in checkpoint["state_dict"].items()
+                if k.startswith("clip_model.vision_model")
+            }
+            self.model.load_state_dict(clipmodel_keys)
 
-        self.model = CLIPVisionModel.from_pretrained(ckpt)
+            # self.model = diff_clip_model.clip_model.vision_model
         self.model.head = torch.nn.Sequential(
             torch.nn.BatchNorm1d(1280, affine=False, eps=1e-6),
             torch.nn.Linear(1280, 100),  # TODO: nb_classes 100 or 1000
@@ -182,11 +189,11 @@ class CLIPVisionLinEval(L.LightningModule):
 
         acc1, acc5 = accuracy(outputs, gt_labels, topk=(1, 5))
 
-        sync_dist = self.trainer.current_epoch == (self.trainer.max_epochs - 1)
-        self.log_dict({"Acc@1": acc1, "Acc@5": acc5, "loss": loss}, prog_bar=True, sync_dist=sync_dist)
+        # sync_dist = self.trainer.current_epoch == (self.trainer.max_epochs - 1)
+        self.log_dict({"Acc@1": acc1, "Acc@5": acc5, "loss": loss}, prog_bar=True, sync_dist=True)
 
     def configure_optimizers(self):
-        optimizer = LARS(self.model.head.parameters(), lr=0.1, weight_decay=0.0)
+        optimizer = LARS(self.model.head.parameters(), lr=0.05, weight_decay=0.0)
         scheduler = torch.optim.lr_scheduler.OneCycleLR(
             optimizer,
             anneal_strategy="cos",
@@ -197,10 +204,13 @@ class CLIPVisionLinEval(L.LightningModule):
 
 
 def create_trainer(output_file_name, args) -> L.Trainer:
-    save_dir = "/home/choi/DiffCLIP/wandb/clip-lineval/{now}_{dirname}".format(now=args.now, dirname=output_file_name)
+    save_root_dir = "/scratch/choi/output/DiffCLIP"
+    save_dir = "{save_root}/clip-lineval/{now}_{dirname}".format(
+        save_root=save_root_dir, now=args.now, dirname=output_file_name
+    )
     wandb_logger = WandbLogger(
-        project="clip-lineval",
-        name=args.now + "_" + output_file_name,
+        project="DiffCLIP",
+        name="clip-lineval/" + args.now + "_" + output_file_name,
         log_model=True,
         config=vars(args),
         save_code=True,
@@ -209,7 +219,9 @@ def create_trainer(output_file_name, args) -> L.Trainer:
     lr_monitor_callback = LearningRateMonitor(logging_interval="epoch")
     trainer = L.Trainer(
         max_epochs=50,
-        logger=CSVLogger(save_dir="/home/choi/DiffCLIP/wandb/trash") if args.test_mode else wandb_logger,
+        logger=(
+            CSVLogger(save_dir="{save_root}/trash".format(save_root=save_root_dir)) if args.test_mode else wandb_logger
+        ),
         # log_every_n_steps=10,
         callbacks=[lr_monitor_callback],
         accelerator="gpu",
@@ -237,14 +249,18 @@ def parse_args():
         "--ckpt",
         type=str,
         help="CLIP ckpt path to evaluate.",
-        default="/scratch/choi/model/CLIP-ViT-H-14-laion2B-s32B-b79K",
+        default=None,
     )
     args = parser.parse_args()
+    if args.ckpt is None:
+        print("Warning. CKPT set to default CLIP. Provide ckpt arg if you intend to evaluate a fine-tuned CLIP")
     return args
 
 
 def main():
-    OUTPUT_FILE_NAME = ""
+    start_time = time.time()
+    # OUTPUT_FILE_NAME = "CLIP-mse-loss-0.001-epoch-1"
+    OUTPUT_FILE_NAME = "default-clip"
 
     L.seed_everything(1)
     args = parse_args()
@@ -254,6 +270,7 @@ def main():
 
     model = CLIPVisionLinEval(args.ckpt)
     trainer.fit(model)
+    print(f"elapsed-time: {timedelta(seconds=(time.time()-start_time))}")
     wandb.finish()
 
 

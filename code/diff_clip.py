@@ -1,11 +1,20 @@
 import warnings
-warnings.filterwarnings("ignore", message=".*`Transformer2DModelOutput` is deprecated and will be removed in version 1.0.0.*")
+
+warnings.filterwarnings(
+    "ignore", message=".*`Transformer2DModelOutput` is deprecated and will be removed in version 1.0.0.*"
+)
+# sync_dist turned off performance
+warnings.filterwarnings(
+    "ignore",
+    ".*sync_dist=True.* when logging on epoch level in distributed setting to accumulate the metric across devices.*",
+)
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 from torchvision.transforms import v2 as T
+import torchvision.datasets as datasets
 
 import lightning as L
 from lightning.pytorch.callbacks import LearningRateMonitor, ModelCheckpoint
@@ -25,39 +34,53 @@ from typing import Any, Literal, Mapping
 import wandb
 import argparse
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta
+from time import time
 from pprint import pprint
 import itertools
 from safetensors import safe_open
 
+from utils import collect_features
+
+
+# Path Configuration
+ROOT_DIR = "/home/choi/DiffCLIP"
+IP_ADAPTER_PATH = "/scratch/choi/model/IP-Adapter/models/ip-adapter_sd15.bin"
+SD_PATH = "/scratch/choi/model/stable-diffusion-v1-5"
+CLIP_PATH = "laion/CLIP-ViT-H-14-laion2B-s32B-b79K"  # or hf repo name
+OUTPUT_PATH = "/scratch/choi/output/DiffCLIP"
+DATASET_PATH = "/scratch/choi/dataset/ImageNet100"
 
 config = {
-    "minibatch_size": 16,
-    "gradient_accum_step": 16,
+    "minibatch_size": 12,
+    "gradient_accum_step": 21,
     "timestep_range": (400, 600),  # 0 for full range
     "resolution": 224,  # TODO: change?
-    "learning_rate": 1e-4,
     "weight_decay": 1e-2,
+    "learning_rate": 5e-5,
+    # "diffusion_loss_scale": 0.001,
+    "ckpt_only_clip_weights": True,
+    "diffusion_loss_scale": 0,
+    "check_1nn": False,
+    "check_zero_shot": True,
 }
+config["filename"] = f"diff-loss-{config['diffusion_loss_scale']}"
 
 
-# TODO: make all roots dynamic
-# TODO: seperate to data module
 class MyDataset(Dataset):
     def __init__(self, is_train: bool):
         super().__init__()
-        IMAGE_ROOT_PATH = "/scratch/choi/dataset/ImageNet100"
         self.mode = "train" if is_train else "val"
 
         # self.tokenizer = None
-        self.image_root_path = f"{IMAGE_ROOT_PATH}/{self.mode}"
+        self.image_root_path = f"{DATASET_PATH}/{self.mode}"
         self.data = json.load(
-            open(f"{IMAGE_ROOT_PATH}/_img_text_pair_{self.mode}.json")
+            open(f"{DATASET_PATH}/_img_text_pair_{self.mode}.json")
         )  # list of dict: [{'class_id': 'n03785016','image_file': 'n03785016_5681.JPEG','text': 'a photo of moped'}]
 
-        self.text_embedding_dict_L = torch.load("/home/choi/DiffCLIP/IN100_text_embedding_dict_L.pt")
+        self.text_embedding_dict_L = torch.load(os.path.join(ROOT_DIR, "IN100_text_embedding_dict_L.pt"))
         self.text_embedding_dict_with_projection_H = torch.load(
-            "/home/choi/DiffCLIP/IN100_text_embedding_dict_with_projection_H.pt"
+            os.path.join(ROOT_DIR, "IN100_text_embedding_dict_with_projection_H.pt")
         )
 
         self.transform = T.Compose(
@@ -67,7 +90,8 @@ class MyDataset(Dataset):
                 T.CenterCrop(config["resolution"]),
                 T.ToImage(),
                 T.ToDtype(torch.float32, scale=True),
-                T.Normalize([0.5], [0.5]),
+                T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+                # T.Normalize([0.5], [0.5]),
             ]
         )
         self.clip_image_processor = CLIPImageProcessor()
@@ -193,22 +217,105 @@ class IPAdapter(nn.Module):
         # print(f"Successfully loaded weights from checkpoint {ckpt_path}")
 
 
-# TODO: use diffclip or clipvisualmodel when doing linear probing?
-class DiffCLIP(L.LightningModule):
+class IN100_DataModule(L.LightningDataModule):
     def __init__(self):
         super().__init__()
-        self.save_hyperparameters()
+        self.image_root_path = DATASET_PATH
+        self.nn_transform = T.Compose(
+            [
+                T.Resize(256, interpolation=3),
+                T.CenterCrop(224),
+                T.ToImage(),
+                T.ToDtype(torch.float32, scale=True),
+                T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+            ]
+        )
+        self.zero_shot_transform = T.Compose(
+            [
+                T.Resize(256, interpolation=3),
+                T.CenterCrop(224),
+                T.ToImage(),
+            ]
+        )
+
+    def setup(self, stage=None):
+        self.train_dataset = MyDataset(is_train=True)
+        self.val_dataset = MyDataset(is_train=False)
+
+        ### 1nn evaluation dataset
+        if config["check_1nn"]:
+            self.nn_train_dataset = datasets.ImageFolder(self.image_root_path + "/train", transform=self.nn_transform)
+            # indices = torch.load("../imagenet_indices.pth")
+            # nn_train_dataset = torch.utils.data.Subset(nn_train_dataset, indices)
+            # TODO: random indexing? Subset? 1nn take too long
+            self.nn_val_dataset = datasets.ImageFolder(self.image_root_path + "/val", transform=self.nn_transform)
+            self.train_sampler = torch.utils.data.DistributedSampler(self.nn_train_dataset)
+
+        if config["check_zero_shot"]:
+            self.zero_shot_dataset = datasets.ImageFolder(
+                self.image_root_path + "/val", transform=self.zero_shot_transform
+            )
+
+    def train_dataloader(self):
+        train_loader = DataLoader(
+            self.train_dataset,
+            shuffle=True,
+            batch_size=config["minibatch_size"] * config["gradient_accum_step"],
+            drop_last=True,
+            num_workers=4,
+        )
+        return train_loader
+
+    def val_dataloader(self):
+        val_loader = DataLoader(
+            self.val_dataset,
+            shuffle=False,
+            batch_size=config["minibatch_size"] * config["gradient_accum_step"],
+            drop_last=True,
+            num_workers=4,
+        )
+        return val_loader
+
+    def nn_train_dataloader(self):
+        return DataLoader(
+            self.nn_train_dataset,
+            batch_size=512,
+            num_workers=4,
+            pin_memory=True,
+            drop_last=True,
+            sampler=self.train_sampler,
+        )
+
+    def nn_val_dataloader(self):
+        return DataLoader(
+            self.nn_val_dataset,
+            batch_size=512,
+            num_workers=4,
+            pin_memory=True,
+            drop_last=False,
+        )
+
+    def zero_shot_dataloader(self):
+        return DataLoader(
+            self.zero_shot_dataset,
+            batch_size=512,
+            num_workers=4,
+            pin_memory=True,
+            drop_last=False,
+        )
+
+
+class DiffCLIP(L.LightningModule):
+    def __init__(self, datamodule):
+        super().__init__()
+        self.save_hyperparameters(ignore=["datamodule"])
+        self.datamodule = datamodule
         self.automatic_optimization = False
 
-        # CLIP_PATH = "/scratch/choi/model/IP-Adapter/models/image_encoder"
-        IP_ADAPTER_PATH = "/scratch/choi/model/IP-Adapter/models/ip-adapter_sd15.bin"
-        SD_PATH = "/scratch/choi/model/stable-diffusion-v1-5"
-
-        # TODO: set requires grad, del text model?
         self.noise_scheduler = DDPMScheduler.from_pretrained(SD_PATH, subfolder="scheduler")
         self.vae = AutoencoderKL.from_pretrained(SD_PATH, subfolder="vae")
         unet = UNet2DConditionModel.from_pretrained(SD_PATH, subfolder="unet")
-        self.clip_model = CLIPModel.from_pretrained("laion/CLIP-ViT-H-14-laion2B-s32B-b79K")
+        self.clip_model = CLIPModel.from_pretrained(CLIP_PATH)
 
         self.vae.requires_grad_(False)
         unet.requires_grad_(False)
@@ -228,32 +335,16 @@ class DiffCLIP(L.LightningModule):
         self.ip_adapter = IPAdapter(unet, image_proj_model, IP_ADAPTER_PATH)
 
     def setup(self, stage: str) -> None:
-        self.train_dataset = MyDataset(is_train=True)
-        self.val_dataset = MyDataset(is_train=False)
+        ### zero-shot dataset
+        if config["check_zero_shot"]:
+            self.processor = CLIPImageProcessor.from_pretrained("laion/CLIP-ViT-H-14-laion2B-s32B-b79K")
 
-    def train_dataloader(self) -> DataLoader:
-        train_loader = DataLoader(
-            self.train_dataset,
-            shuffle=True,
-            batch_size=config["minibatch_size"] * config["gradient_accum_step"],  # TODO: check batch size?
-            num_workers=4,
-        )
-        return train_loader
-
-    def val_dataloader(self) -> DataLoader:
-        val_loader = DataLoader(
-            self.train_dataset,
-            shuffle=True,
-            batch_size=config["minibatch_size"] * config["gradient_accum_step"],
-            num_workers=4,
-        )
-        return val_loader
-
+    # CLIP image encoder with projection
     def forward(self, clip_images) -> Any:
         res = self.clip_model.visual_projection(self.clip_model.vision_model(clip_images.to(self.device)).pooler_output)
         return res
 
-    def shared_step(self, batch):
+    def shared_step(self, batch, is_train=True):
         opt = self.optimizers()
         opt.zero_grad()
         text_embeds = batch["text_embeddings_clip"] / batch["text_embeddings_clip"].norm(p=2, dim=-1, keepdim=True)
@@ -285,8 +376,8 @@ class DiffCLIP(L.LightningModule):
             noisy_latents = self.noise_scheduler.add_noise(latents, noise, timesteps)
 
             image_embeds = self.forward(minibatch_clip_images)
-            noise_pred = self.ip_adapter(noisy_latents, timesteps, minibatch_text_embeddings_sd, image_embeds)
 
+            noise_pred = self.ip_adapter(noisy_latents, timesteps, minibatch_text_embeddings_sd, image_embeds)
             mse_loss = F.mse_loss(noise_pred.float(), noise.float(), reduction="mean")
             image_embeds = image_embeds / image_embeds.norm(p=2, dim=-1, keepdim=True)
             # accelerator.print(clip_model.module.logit_scale.exp())
@@ -297,24 +388,53 @@ class DiffCLIP(L.LightningModule):
                 logits_per_image,
                 idx_start + torch.arange(len(logits_per_image), device=self.device),
             )
-            loss = clip_loss + mse_loss
+            loss = clip_loss + config["diffusion_loss_scale"] * mse_loss
 
-            self.manual_backward(loss)
+            if is_train:
+                self.manual_backward(loss)
 
-        out = {}
-        opt.step()
+        out = {
+            "mse_loss": mse_loss,
+            "clip_loss": clip_loss,
+            "loss": loss,
+            "logit_scale": logit_scale,
+            "mean_timestep": mean_timestep,
+        }
+        if is_train:
+            opt.step()
         return out
 
-    def training_step(self, batch):
+    def training_step(self, batch, b_idx):
         out = self.shared_step(batch)
+        log = {}
+        for key, value in out.items():
+            log["train_" + key] = value
 
-        # return out["loss"]
+        self.log_dict(
+            log,
+            prog_bar=True,
+            batch_size=config["gradient_accum_step"] * config["minibatch_size"],
+        )
+        # return out["loss"] # automatic optimization off
 
-    # def validation_step(self, batch):
-    #     out = self.shared_step(batch)
+    def validation_step(self, batch):
+        out = self.shared_step(batch, is_train=False)
+        log = {}
+        for key, value in out.items():
+            log["val_" + key] = value
+        self.log_dict(
+            log,
+            prog_bar=True,
+            batch_size=config["gradient_accum_step"] * config["minibatch_size"],
+        )
+
+    def on_validation_epoch_end(self) -> None:
+        if config["check_1nn"]:
+            self.evaluate_nn()
+        if config["check_zero_shot"]:
+            self.evaluate_zero_shot()
 
     def configure_optimizers(self):
-        # TODO: check param to update
         params_to_opt = itertools.chain(
             self.ip_adapter.image_proj_model.parameters(),
             self.ip_adapter.adapter_modules.parameters(),
@@ -326,14 +446,93 @@ class DiffCLIP(L.LightningModule):
         optimizer = torch.optim.AdamW(params_to_opt, lr=config["learning_rate"], weight_decay=config["weight_decay"])
         return optimizer
 
-    # TODO: customize save model behavior? save only CLIP? add config.json?
+    # perform 1nn
+    def evaluate_nn(self):
+        start_time = time()
+        X_train, Y_train = collect_features(
+            self.clip_model.vision_model, self.datamodule.nn_train_dataloader(), self.device
+        )
+        X_train = self.all_gather(X_train).reshape(-1, X_train.size(1))
+        Y_train = self.all_gather(Y_train).reshape(-1)
+        X_test, Y_test = collect_features(
+            self.clip_model.vision_model, self.datamodule.nn_val_dataloader(), self.device
+        )
+
+        BATCH_SIZE = 256
+        corrects = []
+        d_train = X_train.T.pow(2).sum(dim=0, keepdim=True)
+        for i in range(0, X_test.shape[0], BATCH_SIZE):
+            X_batch = X_test[i : i + BATCH_SIZE]
+            Y_batch = Y_test[i : i + BATCH_SIZE]
+            d_batch = X_batch.pow(2).sum(dim=1)[:, None]
+            distance = d_batch - torch.mm(X_batch, X_train.T) * 2 + d_train
+            corrects.append((Y_batch == Y_train[distance.argmin(dim=1)]).detach())
+        corrects = torch.cat(corrects)
+        acc = corrects.float().mean()
+
+        if self.trainer.sanity_checking:
+            self.initial_nn_acc = acc
+        self.print(
+            f"epoch: {self.current_epoch}, 1nn acc: {acc}, elapsed-time: {timedelta(seconds=(time()-start_time))}"
+        )
+        self.log_dict(
+            {"1nn-accuracy": acc, "initial-1nn-acc": self.initial_nn_acc},
+            logger=True,
+        )
+
+    # evaluate zero-shot classification accuracy
+    def evaluate_zero_shot(self):
+        start_time = time()
+        correct_predictions = 0
+        total_images = 0
+        text_features = torch.load("../IN100_classnames_text_features.pt")  # precomputed
+        text_features = text_features.to(self.device)
+        text_features /= text_features.norm(dim=-1, keepdim=True)
+        for image_tensors, labels in self.datamodule.zero_shot_dataloader():
+            image_tensors = image_tensors.to(self.device)
+            labels = labels.to(self.device)
+            with torch.no_grad():
+                image_tensors = self.processor.preprocess(images=image_tensors, return_tensors="pt").pixel_values
+                image_features = self.forward(image_tensors)
+            # Normalize features
+            image_features /= image_features.norm(dim=-1, keepdim=True)
+
+            # Calculate cosine similarity between image and text features
+            similarity = (100.0 * image_features @ text_features.T).softmax(dim=-1)
+
+            # Get the class with the highest similarity score for each image in the batch
+            predicted_classes = similarity.argmax(dim=-1)
+
+            # Accuracy calculation with gt
+            correct_predictions += (predicted_classes == labels).sum().item()
+
+            total_images += len(image_tensors)
+
+        acc = correct_predictions / total_images
+        if self.trainer.sanity_checking:
+            self.initial_zero_shot_acc = acc
+        self.print(
+            f"epoch: {self.current_epoch}, zero-shot acc: {acc}, elapsed-time: {timedelta(seconds=(time()-start_time))}"
+        )
+        self.log_dict(
+            {"zero-shot-acc": acc, "initial-zero-shot-acc": self.initial_zero_shot_acc},
+            logger=True,
+        )
+
+    def on_save_checkpoint(self, checkpoint):
+        if config["ckpt_only_clip_weights"]:
+            # Filter state_dict
+            filtered_state_dict = {k: v for k, v in self.state_dict().items() if "clip_model.vision_model" in k}
+            checkpoint["state_dict"] = filtered_state_dict
 
 
 def create_trainer() -> L.Trainer:
-    save_dir = "/home/choi/DiffCLIP/wandb/clip-finetuning/{dirname}".format(dirname=config["now"])
+    save_dir = "{save_root}/clip-finetuning/{dirname}".format(
+        save_root=OUTPUT_PATH, dirname=config["now"] + "_" + config["filename"]
+    )
     wandb_logger = WandbLogger(
-        project="clip-finetuning",
-        name=config["now"],
+        project="DiffCLIP",
+        name="clip-finetuning/" + config["now"] + "_" + config["filename"],
         log_model=True,
         config=config,
         save_code=True,
@@ -341,24 +540,31 @@ def create_trainer() -> L.Trainer:
     )
     lr_monitor_callback = LearningRateMonitor(logging_interval="epoch")
     ckpt_callback = ModelCheckpoint(
-        # save_top_k=2,
-        monitor="val_loss",  # TODO: configure
-        mode="min",
-        save_last=True,
-        filename="{epoch}_{val_loss:.4f}",
+        save_top_k=-1,
+        every_n_epochs=1,
+        # monitor="val_loss",
+        # mode="min",
+        # save_last=True,
+        # save_last=False,
+        # filename="{epoch}_{val_loss:.4f}",
+        filename="{epoch}",
+        save_weights_only=True if config["ckpt_only_clip_weights"] else False,
     )
     trainer = L.Trainer(
         max_epochs=100,
-        logger=CSVLogger(save_dir="/home/choi/DiffCLIP/wandb/trash") if config["test_mode"] else wandb_logger,
+        logger=(
+            CSVLogger(save_dir="{save_root}/trash".format(save_root=OUTPUT_PATH))
+            if config["test_mode"]
+            else wandb_logger
+        ),
         log_every_n_steps=10,
         callbacks=[lr_monitor_callback, ckpt_callback],
         check_val_every_n_epoch=1,
         accelerator="gpu",
         devices=3,
-        # devices=[1],
         strategy="ddp",
+        # strategy="ddp_find_unused_parameters_true",
         precision="16-mixed",
-        # accumulate_grad_batches=8,  # no need. don't use
     )
     if trainer.is_global_zero and not config["test_mode"]:
         Path(save_dir).mkdir(parents=True, exist_ok=True)
@@ -392,11 +598,13 @@ def main():
     if trainer.is_global_zero:
         print("===========================")
         pprint(config)
-        print(f"\n##### Effective Batch Size: {config["gradient_accum_step"] * config["minibatch_size"]}")
+        print("\n##### Effective Batch Size: {bs}".format(bs=config["gradient_accum_step"] * config["minibatch_size"]))
         print("===========================")
 
-    model = DiffCLIP()
-    trainer.fit(model, ckpt_path=None if config["ckpt"] == "None" else config["ckpt"])
+    in100_datamodule = IN100_DataModule()
+    model = DiffCLIP(in100_datamodule)
+
+    trainer.fit(model, datamodule=in100_datamodule, ckpt_path=None if config["ckpt"] == "None" else config["ckpt"])
 
     wandb.finish()
 
