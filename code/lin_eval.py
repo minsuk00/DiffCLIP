@@ -259,8 +259,8 @@ def parse_args():
 
 def main():
     start_time = time.time()
-    # OUTPUT_FILE_NAME = "CLIP-mse-loss-0.001-epoch-1"
-    OUTPUT_FILE_NAME = "default-clip"
+    OUTPUT_FILE_NAME = "CLIP-mse-loss-0.001-epoch-1-resolution-512"
+    # OUTPUT_FILE_NAME = "default-clip"
 
     L.seed_everything(1)
     args = parse_args()

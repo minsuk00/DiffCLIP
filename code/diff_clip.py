@@ -52,15 +52,19 @@ OUTPUT_PATH = "/scratch/choi/output/DiffCLIP"
 DATASET_PATH = "/scratch/choi/dataset/ImageNet100"
 
 config = {
-    "minibatch_size": 12,
-    "gradient_accum_step": 21,
+    "minibatch_size": 6,
+    "gradient_accum_step": 14,
+    # "minibatch_size": 12,
+    # "gradient_accum_step": 21,
     "timestep_range": (400, 600),  # 0 for full range
-    "resolution": 224,  # TODO: change?
+    "clip-resolution": 224,
+    "diffusion-resolution": 512,
+    # "diffusion-resolution": 224,
     "weight_decay": 1e-2,
     "learning_rate": 5e-5,
-    # "diffusion_loss_scale": 0.001,
+    "diffusion_loss_scale": 0.001,
+    # "diffusion_loss_scale": 0,
     "ckpt_only_clip_weights": True,
-    "diffusion_loss_scale": 0,
     "check_1nn": False,
     "check_zero_shot": True,
 }
@@ -85,16 +89,15 @@ class MyDataset(Dataset):
 
         self.transform = T.Compose(
             [
-                # T.Resize(config["resolution"], interpolation=T.InterpolationMode.BILINEAR),
-                T.Resize(config["resolution"], antialias=True),
-                T.CenterCrop(config["resolution"]),
+                T.Resize(config["diffusion-resolution"], antialias=True),
+                T.CenterCrop(config["diffusion-resolution"]),
                 T.ToImage(),
                 T.ToDtype(torch.float32, scale=True),
                 T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
                 # T.Normalize([0.5], [0.5]),
             ]
         )
-        self.clip_image_processor = CLIPImageProcessor()
+        self.clip_image_processor = CLIPImageProcessor({"shortest_edge": config["clip-resolution"]})
 
     def __getitem__(self, idx):
         class_id, image_file, caption = self.data[idx].values()
@@ -269,7 +272,7 @@ class IN100_DataModule(L.LightningDataModule):
     def val_dataloader(self):
         val_loader = DataLoader(
             self.val_dataset,
-            shuffle=False,
+            # shuffle=True,
             batch_size=config["minibatch_size"] * config["gradient_accum_step"],
             drop_last=True,
             num_workers=4,
@@ -347,7 +350,11 @@ class DiffCLIP(L.LightningModule):
     def shared_step(self, batch, is_train=True):
         opt = self.optimizers()
         opt.zero_grad()
-        text_embeds = batch["text_embeddings_clip"] / batch["text_embeddings_clip"].norm(p=2, dim=-1, keepdim=True)
+
+        # gather gt from other gpu's for larger batch size effect
+        text_embeds = self.all_gather(batch["text_embeddings_clip"]).reshape(-1, batch["text_embeddings_clip"].size(1))
+        text_embeds = text_embeds / text_embeds.norm(p=2, dim=-1, keepdim=True)
+        # text_embeds = batch["text_embeddings_clip"] / batch["text_embeddings_clip"].norm(p=2, dim=-1, keepdim=True)
         for i in range(config["gradient_accum_step"]):
             idx_start = config["minibatch_size"] * i
             idx_end = config["minibatch_size"] * (i + 1)
@@ -362,6 +369,7 @@ class DiffCLIP(L.LightningModule):
             # Sample noise that we'll add to the latents
             noise = torch.randn_like(latents)
             bsz = latents.shape[0]
+            # self.print(latents.shape)  # torch.Size([12, 4, 64, 64])
             # Sample a random timestep for each image
             if config["timestep_range"] == 0:
                 timesteps = torch.randint(
@@ -386,7 +394,9 @@ class DiffCLIP(L.LightningModule):
             # logits_per_image = torch.matmul(image_embeds, text_embeds.t())
             clip_loss = nn.functional.cross_entropy(
                 logits_per_image,
-                idx_start + torch.arange(len(logits_per_image), device=self.device),
+                idx_start
+                + self.trainer.local_rank * config["gradient_accum_step"] * config["minibatch_size"]
+                + torch.arange(len(logits_per_image), device=self.device),
             )
             loss = clip_loss + config["diffusion_loss_scale"] * mse_loss
 
@@ -598,7 +608,11 @@ def main():
     if trainer.is_global_zero:
         print("===========================")
         pprint(config)
-        print("\n##### Effective Batch Size: {bs}".format(bs=config["gradient_accum_step"] * config["minibatch_size"]))
+        print(
+            "\n##### Effective Batch Size: {bs}".format(
+                bs=config["gradient_accum_step"] * config["minibatch_size"] * trainer.num_devices
+            )
+        )
         print("===========================")
 
     in100_datamodule = IN100_DataModule()
